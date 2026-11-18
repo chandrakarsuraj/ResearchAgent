@@ -1,8 +1,11 @@
 
-from research_agent.tools.tools import web_search, scrap_url
+from research_agent.pipelines.pipelines import build_pipeline 
 from rich import print
 
+def main():
+    result = build_pipeline("how indian students are performing in the field of AI and ML")
+    print(result)
 
 
-print(scrap_url.invoke("https://sg.finance.yahoo.com/news/nvidia-stock-erases-earnings-pop-as-investors-face-life-after-jensen-huang-173547783.html"))
-
+if __name__ == "__main__":
+    main()

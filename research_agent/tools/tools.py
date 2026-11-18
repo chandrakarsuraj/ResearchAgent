@@ -1,14 +1,16 @@
+import ipaddress
 import os
 import re
-from urllib.parse import urlsplit
+import socket
+from urllib.parse import urljoin, urlsplit
 
 import requests
 import trafilatura
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
+from langchain_core.tools import tool
 from langchain_tavily import TavilySearch
 from readability import Document
-from langchain.tools import tool
 
 load_dotenv()
 
@@ -43,48 +45,91 @@ def web_search(query: str) -> str:
         return f"An error occurred during the web search: {e}"
 
 
+def _validate_public_http_url(url: str) -> None:
+    """Reject malformed URLs and hosts that resolve to non-public IP addresses."""
+    try:
+        parsed_url = urlsplit(url)
+        port = parsed_url.port
+    except ValueError as e:
+        raise ValueError("The URL is malformed.") from e
+
+    if parsed_url.scheme not in {"http", "https"} or not parsed_url.hostname:
+        raise ValueError("Only valid HTTP or HTTPS URLs can be scraped.")
+    if parsed_url.username or parsed_url.password:
+        raise ValueError("URLs containing embedded credentials are not supported.")
+
+    hostname = parsed_url.hostname
+    try:
+        addresses = {ipaddress.ip_address(hostname)}
+    except ValueError:
+        try:
+            records = socket.getaddrinfo(
+                hostname,
+                port or (443 if parsed_url.scheme == "https" else 80),
+                type=socket.SOCK_STREAM,
+            )
+            addresses = {
+                ipaddress.ip_address(record[4][0].split("%", 1)[0])
+                for record in records
+            }
+        except (OSError, ValueError) as e:
+            raise ValueError("The URL host could not be resolved safely.") from e
+
+    if not addresses or any(not address.is_global for address in addresses):
+        raise ValueError("Scraping hosts on private or non-public networks is not allowed.")
+
+
 @tool
 def scrap_url(url: str) -> str:
-    """Download a web page and extract its main readable text."""
+    """Safely fetch a public webpage and extract bounded readable text."""
     if not isinstance(url, str) or not url.strip():
         return "Please provide a non-empty URL."
 
-    url = url.strip()
-    parsed_url = urlsplit(url)
-    if parsed_url.scheme not in {"http", "https"} or not parsed_url.hostname:
-        return "Please provide a valid HTTP or HTTPS URL."
-    if parsed_url.username or parsed_url.password:
-        return "URLs containing embedded credentials are not supported."
-
-    max_bytes = 3_000_000
+    current_url = url.strip()
+    response = None
     try:
-        with requests.get(
-            url,
-            headers={"User-Agent": "ResearchAgent/1.0"},
-            timeout=(5, 20),
-            stream=True,
-        ) as response:
-            response.raise_for_status()
-            final_url = urlsplit(response.url)
-            if final_url.scheme not in {"http", "https"} or not final_url.hostname:
-                return "The URL redirected to an invalid destination."
+        redirect_statuses = {301, 302, 303, 307, 308}
+        for redirect_count in range(6):
+            _validate_public_http_url(current_url)
+            response = requests.get(
+                current_url,
+                headers={"User-Agent": "ResearchAgent/1.0"},
+                timeout=(5, 20),
+                stream=True,
+                allow_redirects=False,
+            )
+            if response.status_code not in redirect_statuses:
+                break
 
-            content_type = response.headers.get("Content-Type", "").lower()
-            if content_type and "html" not in content_type:
-                return f"The URL did not return an HTML page (content type: {content_type})."
+            location = response.headers.get("Location")
+            response.close()
+            response = None
+            if not location:
+                return "The webpage returned a redirect without a destination."
+            if redirect_count == 5:
+                return "The webpage exceeded the maximum number of redirects."
+            current_url = urljoin(current_url, location)
 
-            html_chunks = []
-            downloaded_bytes = 0
-            for chunk in response.iter_content(chunk_size=64 * 1024):
-                if not chunk:
-                    continue
-                downloaded_bytes += len(chunk)
-                if downloaded_bytes > max_bytes:
-                    return "The webpage is too large to scrape (limit: 3 MB)."
-                html_chunks.append(chunk)
+        response.raise_for_status()
+        content_type = response.headers.get("Content-Type", "").lower()
+        if content_type and "html" not in content_type:
+            return f"The URL did not return an HTML page (content type: {content_type})."
 
-            html = b"".join(html_chunks).decode(response.encoding or "utf-8", errors="replace")
-            page_url = response.url
+        max_bytes = 3_000_000
+        html_chunks = []
+        downloaded_bytes = 0
+        for chunk in response.iter_content(chunk_size=64 * 1024):
+            if not chunk:
+                continue
+            downloaded_bytes += len(chunk)
+            if downloaded_bytes > max_bytes:
+                return "The webpage is too large to scrape (limit: 3 MB)."
+            html_chunks.append(chunk)
+
+        html = b"".join(html_chunks).decode(response.encoding or "utf-8", errors="replace")
+        page_url = response.url
+        response.close()
+        response = None
 
         soup = BeautifulSoup(html, "html.parser")
         title = soup.title.get_text(" ", strip=True) if soup.title else ""
@@ -116,9 +161,18 @@ def scrap_url(url: str) -> str:
         if not content:
             return f"No readable page content found at {page_url}."
 
+        max_content_chars = 6_000
+        if len(content) > max_content_chars:
+            content = content[:max_content_chars].rstrip() + "\n[Content truncated at 6000 characters.]"
+
         title = title or readability_title or "Untitled"
         return f"Title: {title}\nURL: {page_url}\n\n{content}"
+    except ValueError as e:
+        return f"Cannot scrape URL: {e}"
     except requests.RequestException as e:
         return f"Could not fetch webpage ({type(e).__name__}): {e}"
     except Exception as e:
         return f"An error occurred while scraping the webpage: {e}"
+    finally:
+        if response is not None:
+            response.close()
